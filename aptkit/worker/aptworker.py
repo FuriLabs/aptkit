@@ -846,7 +846,55 @@ class AptWorker(BaseWorker):
         # FIXME: What to do if already uptotdate? Add error code?
         self._call_plugins("modify_cache_before")
         try:
-            self._cache.upgrade(dist_upgrade=not safe_mode)
+            if safe_mode:
+                # First perform the traditional safe upgrade.
+                self._cache.upgrade(dist_upgrade=False)
+
+                resolver = apt.cache.ProblemResolver(self._cache)
+
+                # Try to upgrade kept-back packages one-by-one.
+                for pkg in self._iterate_packages():
+                    if not pkg.is_upgradable or not pkg.marked_keep:
+                        continue
+
+                    before_changes = set(
+                        p.name for p in self._cache.get_changes()
+                    )
+
+                    with self._cache.actiongroup():
+                        auto = pkg.is_auto_installed
+
+                        pkg.mark_install(False, False, True)
+                        pkg.mark_auto(auto)
+
+                        resolver.clear(pkg)
+                        resolver.protect(pkg)
+
+                        try:
+                            self._resolve_depends(trans, resolver)
+                        except TransactionFailed:
+                            pkg.mark_keep()
+                            continue
+
+                    removals = [
+                        p for p in self._cache.get_changes()
+                        if p.marked_delete
+                    ]
+
+                    if removals:
+                        # Reject this upgrade attempt.
+                        pkg.mark_keep()
+
+                        # Undo any packages introduced by this attempt.
+                        for changed in self._cache.get_changes():
+                            if changed.name not in before_changes:
+                                changed.mark_keep()
+
+                        resolver.clear(pkg)
+                        continue
+            else:
+                self._cache.upgrade(dist_upgrade=True)
+
         except SystemError as excep:
             raise TransactionFailed(ERROR_DEP_RESOLUTION_FAILED, str(excep))
         self._call_plugins("modify_cache_after")

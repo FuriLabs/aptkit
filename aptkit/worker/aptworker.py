@@ -857,6 +857,10 @@ class AptWorker(BaseWorker):
                     if not pkg.is_upgradable or not pkg.marked_keep:
                         continue
 
+                    # Skip held packages with apt-mark hold
+                    if pkg._pkg.selected_state == apt_pkg.SELSTATE_HOLD:
+                        continue
+
                     before_changes = set(
                         p.name for p in self._cache.get_changes()
                     )

@@ -290,6 +290,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
         "error": None,
         "finished_signal_state": None,
         "simulate_ready": False,
+        "resolved_config_conflicts": set(),
     }
 
     loop = GLib.MainLoop()
@@ -371,6 +372,37 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             loop.quit()
         return GLib.SOURCE_REMOVE
 
+    def resolve_config_file_conflict(old):
+        if old in state["resolved_config_conflicts"]:
+            return
+
+        state["resolved_config_conflicts"].add(old)
+        print(
+            f"Configuration file conflict for {old}: "
+            "installing the new version "
+            f"(previous version saved as {old}.dpkg-old).",
+            flush=True,
+        )
+
+        def on_resolved(proxy, result):
+            try:
+                proxy.call_finish(result)
+            except GLib.Error as exc:
+                print(
+                    "Failed to resolve configuration file conflict for "
+                    f"{old}: {exc.message}",
+                    flush=True,
+                )
+
+        transaction_proxy.call(
+            "ResolveConfigFileConflict",
+            GLib.Variant("(ss)", (old, "replace")),
+            Gio.DBusCallFlags.NONE,
+            DBUS_CALL_TIMEOUT_MS,
+            None,
+            on_resolved,
+        )
+
     def handle_property_changed(property_name, value_variant):
         actual_variant = unwrap_variant(value_variant)
 
@@ -412,6 +444,21 @@ def run_transaction_once(transaction_path, simulate, show_updates):
         if property_name == "ProgressDownload":
             if isinstance(value, tuple) and len(value) == 6:
                 on_progress_download(value)
+            return
+
+        if property_name == "ConfigFileConflict":
+            # The property is a D-Bus (ss) struct of (old_path, new_path),
+            # so only act if the payload has that exact shape. The daemon
+            # resets the property to ("", "") once a conflict is resolved,
+            # so an empty old_path means "no active conflict" and calling
+            # ResolveConfigFileConflict then would just error out.
+            if (
+                isinstance(value, (tuple, list))
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and value[0]
+            ):
+                resolve_config_file_conflict(value[0])
             return
 
         if property_name == "ExitState":

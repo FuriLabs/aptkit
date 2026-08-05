@@ -21,6 +21,7 @@ import sys
 import time
 
 from gi.repository import Gio, GLib
+from tqdm import tqdm
 
 APTKIT_BUS_NAME = "org.aptkit"
 APTKIT_OBJECT_PATH = "/org/aptkit"
@@ -34,10 +35,13 @@ RETRY_DELAY_SECONDS = 5
 DBUS_CALL_TIMEOUT_MS = 60 * 60 * 1000
 SIMULATE_WAIT_TIMEOUT_SECONDS = 300
 RUN_WAIT_TIMEOUT_SECONDS = 7200
+PROGRESS_REFRESH_INTERVAL_SECONDS = 1
 
 last_progress = None
 last_status = None
 seen_download_descriptions = set()
+progress_bar = None
+progress_refresh_id = None
 main_proxy = None
 
 class AptkitError(Exception):
@@ -64,32 +68,67 @@ def reset_transaction_state():
     global last_progress
     global last_status
     global seen_download_descriptions
+    close_progress_bar()
     last_progress = None
     last_status = None
     seen_download_descriptions = set()
+
+def close_progress_bar():
+    global progress_bar
+    global progress_refresh_id
+
+    if progress_refresh_id is not None:
+        try:
+            GLib.source_remove(progress_refresh_id)
+        except Exception:
+            pass
+        progress_refresh_id = None
+
+    if progress_bar is None:
+        return
+
+    progress_bar.close()
+    progress_bar = None
+
+def refresh_progress_bar():
+    if progress_bar is None:
+        return GLib.SOURCE_REMOVE
+
+    progress_bar.refresh()
+    return GLib.SOURCE_CONTINUE
+
+def print_output(message, file=None):
+    output = sys.stdout if file is None else file
+
+    if progress_bar is not None:
+        tqdm.write(message, file=output)
+    else:
+        print(message, file=output, flush=True)
 
 def print_updates(title, packages, dependencies):
     pkg_list = sorted(set(packages))
     dep_list = sorted(set(dependencies))
 
     if not pkg_list and not dep_list:
-        print(f"{title}: none", flush=True)
+        print_output(f"{title}: none")
         return
 
-    print(f"{title}:", flush=True)
+    print_output(f"{title}:")
 
     if pkg_list:
-        print("  Packages:", flush=True)
+        print_output("  Packages:")
         for pkg in pkg_list:
-            print(f"    {pkg}", flush=True)
+            print_output(f"    {pkg}")
 
     if dep_list:
-        print("  Dependencies:", flush=True)
+        print_output("  Dependencies:")
         for dep in dep_list:
-            print(f"    {dep}", flush=True)
+            print_output(f"    {dep}")
 
 def on_progress(progress):
     global last_progress
+    global progress_bar
+    global progress_refresh_id
 
     if progress < 0 or progress > 100:
         return
@@ -97,8 +136,27 @@ def on_progress(progress):
     if progress == last_progress:
         return
 
+    if progress_bar is None:
+        progress_bar = tqdm(
+            total=100,
+            desc="Progress",
+            unit="%",
+            file=sys.stdout,
+            leave=False,
+            miniters=1,
+            bar_format="{desc}: {bar} {percentage:3.0f}% [{elapsed}]",
+        )
+        progress_refresh_id = GLib.timeout_add_seconds(
+            PROGRESS_REFRESH_INTERVAL_SECONDS,
+            refresh_progress_bar,
+        )
+
+    if last_progress is None:
+        progress_bar.update(progress)
+    else:
+        progress_bar.update(progress - last_progress)
+
     last_progress = progress
-    print(f"Progress: {progress}%", flush=True)
 
 def on_status(status):
     global last_status
@@ -110,7 +168,7 @@ def on_status(status):
         return
 
     last_status = status
-    print(f"Status: {status}", flush=True)
+    print_output(f"Status: {status}")
 
 def on_progress_download(data):
     global seen_download_descriptions
@@ -136,9 +194,9 @@ def on_progress_download(data):
     seen_download_descriptions.add(key)
 
     if status == "download-fetching":
-        print(f"Downloading: {description}", flush=True)
+        print_output(f"Downloading: {description}")
     elif status == "download-done":
-        print(f"Downloaded: {description}", flush=True)
+        print_output(f"Downloaded: {description}")
 
 def init_main_proxy():
     global main_proxy
@@ -153,7 +211,7 @@ def init_main_proxy():
     )
 
 def update_cache():
-    print("Updating package cache...", flush=True)
+    print_output("Updating package cache...")
     execute_main_transaction(
         method_name="UpdateCache",
         parameters=GLib.Variant("()", ()),
@@ -166,7 +224,7 @@ def simulate_upgrade(safe_mode):
     if not safe_mode:
         mode = "full"
 
-    print(f"Simulating {mode} upgrade...", flush=True)
+    print_output(f"Simulating {mode} upgrade...")
 
     result = execute_main_transaction(
         method_name="UpgradeSystem",
@@ -182,7 +240,7 @@ def simulate_upgrade(safe_mode):
             result["dependencies"],
         )
     else:
-        print(f"No updates found in {mode} mode.", flush=True)
+        print_output(f"No updates found in {mode} mode.")
 
     return result
 
@@ -191,7 +249,7 @@ def run_upgrade(safe_mode):
     if not safe_mode:
         mode = "full"
 
-    print(f"Running {mode} upgrade...", flush=True)
+    print_output(f"Running {mode} upgrade...")
 
     return execute_main_transaction(
         method_name="UpgradeSystem",
@@ -220,9 +278,8 @@ def execute_main_transaction(method_name, parameters, simulate, show_updates):
             if attempt >= MAX_RETRIES:
                 break
 
-            print(
+            print_output(
                 f"Retry {attempt}/{MAX_RETRIES} after error: {exc}",
-                flush=True,
             )
             time.sleep(RETRY_DELAY_SECONDS)
 
@@ -320,7 +377,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             if packages_variant is not None:
                 state["packages"] = extract_packages_property(packages_variant)
         except Exception as exc:
-            print(f"refresh_initial_properties Packages error: {exc}", flush=True)
+            print_output(f"refresh_initial_properties Packages error: {exc}")
 
         try:
             dependencies_variant = unwrap_variant(
@@ -331,7 +388,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                     dependencies_variant
                 )
         except Exception as exc:
-            print(f"refresh_initial_properties Dependencies error: {exc}", flush=True)
+            print_output(f"refresh_initial_properties Dependencies error: {exc}")
 
         try:
             progress_variant = unwrap_variant(
@@ -342,7 +399,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 if isinstance(progress, int):
                     on_progress(progress)
         except Exception as exc:
-            print(f"refresh_initial_properties Progress error: {exc}", flush=True)
+            print_output(f"refresh_initial_properties Progress error: {exc}")
 
         try:
             status_variant = unwrap_variant(
@@ -353,7 +410,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 if isinstance(status, str):
                     on_status(status)
         except Exception as exc:
-            print(f"refresh_initial_properties Status error: {exc}", flush=True)
+            print_output(f"refresh_initial_properties Status error: {exc}")
 
         try:
             exit_state_variant = unwrap_variant(
@@ -364,7 +421,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 if isinstance(exit_state, str):
                     state["exit_state"] = exit_state
         except Exception as exc:
-            print(f"refresh_initial_properties ExitState error: {exc}", flush=True)
+            print_output(f"refresh_initial_properties ExitState error: {exc}")
 
     def on_timeout():
         state["error"] = "Timed out waiting for transaction state"
@@ -377,21 +434,19 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             return
 
         state["resolved_config_conflicts"].add(old)
-        print(
+        print_output(
             f"Configuration file conflict for {old}: "
             "installing the new version "
-            f"(previous version saved as {old}.dpkg-old).",
-            flush=True,
+            f"(previous version saved as {old}.dpkg-old)."
         )
 
         def on_resolved(proxy, result):
             try:
                 proxy.call_finish(result)
             except GLib.Error as exc:
-                print(
+                print_output(
                     "Failed to resolve configuration file conflict for "
-                    f"{old}: {exc.message}",
-                    flush=True,
+                    f"{old}: {exc.message}"
                 )
 
         transaction_proxy.call(
@@ -560,7 +615,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             raise AptkitError(state["error"])
 
         if simulate:
-            print("Simulation data collected.", flush=True)
+            print_output("Simulation data collected.")
             return make_transaction_result(
                 exit_state="simulated",
                 packages=set(state["packages"]) if show_updates else set(),
@@ -568,7 +623,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             )
 
         exit_state = state["exit_state"]
-        print(f"Transaction finished with state: {exit_state}", flush=True)
+        print_output(f"Transaction finished with state: {exit_state}")
 
         if exit_state == "exit-success":
             return make_transaction_result(
@@ -591,6 +646,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
 
         raise AptkitError(f"Unexpected transaction exit state: {exit_state!r}")
     finally:
+        close_progress_bar()
         try:
             transaction_proxy.disconnect(signal_id)
         except Exception:
@@ -755,21 +811,21 @@ def main():
 
             break
 
-        print("All updates have been fully applied.", flush=True)
+        print_output("All updates have been fully applied.")
 
         version = read_furios_version()
         if version:
-            print(f"FuriOS {version}", flush=True)
+            print_output(f"FuriOS {version}")
 
         return 0
     except AptkitError as exc:
-        print(f"error: {exc}", file=sys.stderr, flush=True)
+        print_output(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("error: interrupted", file=sys.stderr, flush=True)
+        print_output("error: interrupted", file=sys.stderr)
         return 130
     except GLib.Error as exc:
-        print(f"error: {exc.message}", file=sys.stderr, flush=True)
+        print_output(f"error: {exc.message}", file=sys.stderr)
         return 1
 
 if __name__ == "__main__":

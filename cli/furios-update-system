@@ -14,6 +14,7 @@
 #   6. Update cache again
 #   7. Then try safe mode again
 #   8. Repeat until both safe and full upgrades have nothing left
+#   9. If the cache is broken, repair dependencies once and restart
 
 import os
 import re
@@ -31,11 +32,14 @@ APTKIT_TRANSACTION_INTERFACE = "org.aptkit.transaction"
 VERSION_FILE = "/usr/share/furios-branding/furios-version"
 
 MAX_RETRIES = 10
+MAX_BROKEN_DEPENDENCY_REPAIRS = 1
 RETRY_DELAY_SECONDS = 5
 DBUS_CALL_TIMEOUT_MS = 60 * 60 * 1000
 SIMULATE_WAIT_TIMEOUT_SECONDS = 300
 RUN_WAIT_TIMEOUT_SECONDS = 7200
 PROGRESS_REFRESH_INTERVAL_SECONDS = 1
+
+ERROR_CACHE_BROKEN = "error-cache-broken"
 
 last_progress = None
 last_status = None
@@ -45,7 +49,10 @@ progress_refresh_id = None
 main_proxy = None
 
 class AptkitError(Exception):
-    pass
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
 
 def make_transaction_result(exit_state, packages=None, dependencies=None):
     if packages is None:
@@ -219,6 +226,30 @@ def update_cache():
         show_updates=False,
     )
 
+
+def repair_broken_dependencies():
+    print_output(
+        "The installed package set has broken dependencies; "
+        "attempting an automatic repair..."
+    )
+    try:
+        execute_main_transaction(
+            method_name="FixBrokenDepends",
+            parameters=GLib.Variant("()", ()),
+            simulate=False,
+            show_updates=False,
+            max_retries=1,
+        )
+    except AptkitError as exc:
+        raise AptkitError(
+            "Automatic dependency repair failed; check that all configured "
+            "repositories provide compatible package versions. "
+            f"Repair error: {exc}",
+            code=exc.code,
+        ) from exc
+
+    print_output("Broken dependency repair completed.")
+
 def simulate_upgrade(safe_mode):
     mode = "safe"
     if not safe_mode:
@@ -258,10 +289,16 @@ def run_upgrade(safe_mode):
         show_updates=True,
     )
 
-def execute_main_transaction(method_name, parameters, simulate, show_updates):
+def execute_main_transaction(
+    method_name,
+    parameters,
+    simulate,
+    show_updates,
+    max_retries=MAX_RETRIES,
+):
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             transaction_path = call_main_method_get_transaction_path(
                 method_name,
@@ -275,11 +312,20 @@ def execute_main_transaction(method_name, parameters, simulate, show_updates):
         except Exception as exc:
             last_error = exc
 
-            if attempt >= MAX_RETRIES:
+            # A broken cache is persistent package state. Repeating the same
+            # transaction cannot repair it, so return it to the workflow
+            # immediately and let FixBrokenDepends handle it.
+            if (
+                isinstance(exc, AptkitError)
+                and exc.code == ERROR_CACHE_BROKEN
+            ):
+                raise
+
+            if attempt >= max_retries:
                 break
 
             print_output(
-                f"Retry {attempt}/{MAX_RETRIES} after error: {exc}",
+                f"Retry {attempt}/{max_retries} after error: {exc}",
             )
             time.sleep(RETRY_DELAY_SECONDS)
 
@@ -458,6 +504,40 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             on_resolved,
         )
 
+    def get_error_code_details() -> tuple[str | None, str | None]:
+        error_code = None
+        error_details = None
+
+        error_result = transaction_proxy.get_connection().call_sync(
+            APTKIT_BUS_NAME,
+            transaction_path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant(
+                "(ss)",
+                (APTKIT_TRANSACTION_INTERFACE, "Error"),
+            ),
+            GLib.VariantType.new("(v)"),
+            Gio.DBusCallFlags.NONE,
+            DBUS_CALL_TIMEOUT_MS,
+            None,
+        )
+        error_variant = unwrap_variant(
+            error_result.get_child_value(0)
+        )
+        error_value = error_variant.unpack()
+
+        if (
+            isinstance(error_value, (tuple, list))
+            and len(error_value) == 2
+        ):
+            if isinstance(error_value[0], str) and error_value[0]:
+                error_code = error_value[0]
+            if isinstance(error_value[1], str) and error_value[1]:
+                error_details = error_value[1]
+
+        return error_code, error_details
+
     def handle_property_changed(property_name, value_variant):
         actual_variant = unwrap_variant(value_variant)
 
@@ -574,8 +654,25 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 None,
             )
         except GLib.Error as exc:
+            error_code = None
+            error_details = exc.message
+
+            try:
+                fetched_code, fetched_details = get_error_code_details()
+
+                if fetched_code is not None:
+                    error_code = fetched_code
+                if fetched_details is not None:
+                    error_details = fetched_details
+            except Exception:
+                # Preserve the original GDBus error if the transaction has
+                # disappeared or its structured Error property is unavailable.
+                pass
+
             raise AptkitError(
-                f"{method} on transaction {transaction_path} failed: {exc.message}"
+                f"{method} on transaction {transaction_path} failed: "
+                f"{error_details}",
+                code=error_code,
             ) from exc
 
         refresh_initial_properties()
@@ -791,25 +888,50 @@ def main():
     try:
         init_main_proxy()
 
+        broken_dependency_repairs = 0
+
         while True:
-            drain_safe_updates()
+            try:
+                drain_safe_updates()
 
-            if full_upgrade_once():
+                if full_upgrade_once():
+                    continue
+
+                update_cache()
+                safe_check = simulate_upgrade(safe_mode=True)
+                if has_updates(safe_check):
+                    run_upgrade(safe_mode=True)
+                    continue
+
+                update_cache()
+                full_check = simulate_upgrade(safe_mode=False)
+                if has_updates(full_check):
+                    run_upgrade(safe_mode=False)
+                    continue
+
+                break
+            except AptkitError as exc:
+                if exc.code != ERROR_CACHE_BROKEN:
+                    raise
+
+                if (
+                    broken_dependency_repairs
+                    >= MAX_BROKEN_DEPENDENCY_REPAIRS
+                ):
+                    raise AptkitError(
+                        "Package dependencies are still broken after an "
+                        "automatic repair; check that all configured "
+                        "repositories provide compatible package versions. "
+                        f"Last error: {exc}",
+                        code=ERROR_CACHE_BROKEN,
+                    ) from exc
+
+                print_output(f"Detected broken package dependencies: {exc}")
+                broken_dependency_repairs += 1
+                repair_broken_dependencies()
+
+                # Restart, which refreshes the cache before calculating another upgrade.
                 continue
-
-            update_cache()
-            safe_check = simulate_upgrade(safe_mode=True)
-            if has_updates(safe_check):
-                run_upgrade(safe_mode=True)
-                continue
-
-            update_cache()
-            full_check = simulate_upgrade(safe_mode=False)
-            if has_updates(full_check):
-                run_upgrade(safe_mode=False)
-                continue
-
-            break
 
         print_output("All updates have been fully applied.")
 

@@ -522,6 +522,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             DBUS_CALL_TIMEOUT_MS,
             None,
         )
+
         error_variant = unwrap_variant(
             error_result.get_child_value(0)
         )
@@ -623,7 +624,10 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 if isinstance(finished_state, str):
                     state["finished_signal_state"] = finished_state
 
-                    if not simulate and state["exit_state"] in (None, "exit-unfinished"):
+                    if not simulate and state["exit_state"] in (
+                        None,
+                        "exit-unfinished",
+                    ):
                         if finished_state.lower().startswith("successful"):
                             state["exit_state"] = "exit-success"
 
@@ -733,6 +737,44 @@ def run_transaction_once(transaction_path, simulate, show_updates):
             raise AptkitError("Transaction was cancelled")
 
         if exit_state == "exit-failed":
+            error_code = None
+            error_details = None
+
+            try:
+                error_code, error_details = get_error_code_details()
+            except Exception as exc:
+                error_details = f"Unable to retrieve transaction error: {exc}"
+
+            if error_code and error_details:
+                print_output(
+                    f"Transaction error: {error_code}: {error_details}",
+                    file=sys.stderr,
+                )
+                raise AptkitError(
+                    f"Transaction failed: {error_details}",
+                    code=error_code,
+                )
+
+            if error_details:
+                print_output(
+                    f"Transaction error: {error_details}",
+                    file=sys.stderr,
+                )
+                raise AptkitError(
+                    f"Transaction failed: {error_details}",
+                    code=error_code,
+                )
+
+            if error_code:
+                print_output(
+                    f"Transaction error: {error_code}",
+                    file=sys.stderr,
+                )
+                raise AptkitError(
+                    f"Transaction failed: {error_code}",
+                    code=error_code,
+                )
+
             raise AptkitError("Transaction failed")
 
         if exit_state == "exit-previous-failed":

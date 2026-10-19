@@ -25,7 +25,6 @@ Depends:
  python3-dbus,
  python3-defer,
  python3-gi,
- python3-pkg-resources,
  python3-tqdm,
 Description: transaction based package management service
  Aptkit allows users to perform package management tasks,

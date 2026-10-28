@@ -31,7 +31,7 @@ APTKIT_TRANSACTION_INTERFACE = "org.aptkit.transaction"
 
 VERSION_FILE = "/usr/share/furios-branding/furios-version"
 
-MAX_RETRIES = 10
+MAX_RETRIES = 5
 MAX_BROKEN_DEPENDENCY_REPAIRS = 1
 RETRY_DELAY_SECONDS = 5
 DBUS_CALL_TIMEOUT_MS = 60 * 60 * 1000

@@ -31,7 +31,7 @@ APTKIT_TRANSACTION_INTERFACE = "org.aptkit.transaction"
 
 VERSION_FILE = "/usr/share/furios-branding/furios-version"
 
-MAX_RETRIES = 10
+MAX_RETRIES = 5
 MAX_BROKEN_DEPENDENCY_REPAIRS = 1
 RETRY_DELAY_SECONDS = 5
 DBUS_CALL_TIMEOUT_MS = 60 * 60 * 1000
@@ -187,6 +187,18 @@ def on_progress_download(data):
 
     description = (description or "").strip()
     status = (status or "").strip()
+
+    if status in ("download-error", "download-auth-error", "download-network-error"):
+        target = description or url or "unknown download"
+        if url and url != target:
+            target = f"{target} ({url})"
+        details = (message or "").strip() or "No error details provided"
+        diagnostic = f"Download failed [{status}]: {target}: {details}"
+        key = (status, url, description, details)
+        if key not in seen_download_descriptions:
+            seen_download_descriptions.add(key)
+            print_output(diagnostic, file=sys.stderr)
+        return diagnostic
 
     if not description:
         return
@@ -391,6 +403,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
         "packages": set(),
         "dependencies": set(),
         "error": None,
+        "transaction_error": (None, None),
         "finished_signal_state": None,
         "simulate_ready": False,
         "resolved_config_conflicts": set(),
@@ -505,8 +518,9 @@ def run_transaction_once(transaction_path, simulate, show_updates):
         )
 
     def get_error_code_details() -> tuple[str | None, str | None]:
-        error_code = None
-        error_details = None
+        error_code, error_details = state["transaction_error"]
+        if error_code or error_details:
+            return error_code, error_details
 
         error_result = transaction_proxy.get_connection().call_sync(
             APTKIT_BUS_NAME,
@@ -536,6 +550,8 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 error_code = error_value[0]
             if isinstance(error_value[1], str) and error_value[1]:
                 error_details = error_value[1]
+        else:
+            raise ValueError(f"Invalid transaction Error property: {error_value!r}")
 
         return error_code, error_details
 
@@ -575,6 +591,20 @@ def run_transaction_once(transaction_path, simulate, show_updates):
         if property_name == "Status":
             if isinstance(value, str):
                 on_status(value)
+            return
+
+        if property_name == "Error":
+            if (
+                isinstance(value, (tuple, list)) and len(value) == 2
+                and all(isinstance(part, str) for part in value)
+            ):
+                error = tuple(part or None for part in value)
+                if any(error) and error != state["transaction_error"]:
+                    state["transaction_error"] = error
+                    details = ": ".join(part for part in error if part)
+                    print_output(f"Transaction error: {details}", file=sys.stderr)
+            else:
+                print_output(f"Invalid transaction Error property: {value!r}", file=sys.stderr)
             return
 
         if property_name == "ProgressDownload":
@@ -751,7 +781,7 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                     file=sys.stderr,
                 )
                 raise AptkitError(
-                    f"Transaction failed: {error_details}",
+                    f"Transaction failed: {error_code}: {error_details}",
                     code=error_code,
                 )
 
@@ -775,7 +805,9 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                     code=error_code,
                 )
 
-            raise AptkitError("Transaction failed")
+            raise AptkitError(
+                "Transaction failed: Aptkit provided no error code or details"
+            )
 
         if exit_state == "exit-previous-failed":
             raise AptkitError("Previous transaction failed")
